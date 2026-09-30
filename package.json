@@ -1,0 +1,41 @@
+{
+  "name": "ab-video-bench",
+  "version": "0.1.0",
+  "description": "A/B page-load benchmark over the Chrome DevTools Protocol with strict alternation, cold and hot sets, and deterministic side-by-side annotated videos.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "ab-bench": "bin/ab-bench.mjs",
+    "ab-video": "bin/ab-video.mjs",
+    "ab-demo": "bin/ab-demo.mjs"
+  },
+  "exports": {
+    ".": "./src/index.mjs",
+    "./abmark": "./browser/abmark.js",
+    "./abmark.js": "./browser/abmark.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "bin",
+    "src",
+    "browser",
+    "demo",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test",
+    "demo": "node bin/ab-demo.mjs",
+    "mock": "node bin/ab-bench.mjs --mock --config demo/scenarios.mjs --cold 5 --hot 5 --root ab-results/mock"
+  },
+  "keywords": [
+    "benchmark",
+    "performance",
+    "ab-test",
+    "chrome-devtools-protocol",
+    "screencast",
+    "ffmpeg",
+    "page-load"
+  ]
+}

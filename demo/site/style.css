@@ -1,0 +1,17 @@
+* { box-sizing: border-box; }
+body { margin: 0; font: 16px/1.4 system-ui, sans-serif; background: #14161d; color: #e8eaf0; }
+body.frame { background: #1c2030; display: flex; align-items: center; justify-content: center; height: 100vh; }
+header { display: flex; justify-content: space-between; align-items: center; padding: 16px 24px; background: #2a2f3d; }
+header h1 { margin: 0; font-size: 22px; }
+#variant { color: #aab0bf; font-size: 14px; }
+button { margin: 24px; padding: 14px 28px; font-size: 18px; border: 0; border-radius: 8px; background: #4fc3f7; color: #0e1016; cursor: pointer; }
+.grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; padding: 24px; }
+.tile { height: 110px; border-radius: 10px; padding: 14px; background: #262b3a; border: 2px solid transparent; position: relative; overflow: hidden; }
+.tile b { display: block; font-size: 15px; }
+.tile span { font-size: 28px; font-weight: 700; }
+.tile i { position: absolute; left: 0; bottom: 0; height: 6px; background: #66bb6a; }
+.skeleton { background: linear-gradient(90deg, #262b3a, #313748, #262b3a); }
+aside { padding: 0 24px 24px; }
+iframe { width: 100%; height: 64px; border: 0; border-radius: 10px; }
+.badge { font-size: 18px; color: #ffb74d; }
+.badge.ok { color: #66bb6a; }

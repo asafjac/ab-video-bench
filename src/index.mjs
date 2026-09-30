@@ -1,0 +1,12 @@
+export {Recorder, runVisible, FatalRunError} from "./recorder.mjs";
+export {launchChrome, findChrome} from "./chrome.mjs";
+export {Cdp, browserWsUrl} from "./cdp.mjs";
+export {loadConfig, normalizeConfig, DEFAULT_PREFIX} from "./scenario.mjs";
+export {makeStrategy} from "./variants.mjs";
+export {runSet, defaultRoot} from "./runner.mjs";
+export {renderAbVideo} from "./render.mjs";
+export {abSchedule, checkVariant, readRuns, medianRun, markMedians, syncSummary, buildReport, VARIANTS, PHASES} from "./ab.mjs";
+export {median, quantile, stats} from "./stats.mjs";
+export {measureSync, syncFlashJs} from "./sync.mjs";
+export {buildRunTimeline} from "./timeline.mjs";
+export {mockRun, writeMockFrames} from "./mock.mjs";
