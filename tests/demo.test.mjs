@@ -5,7 +5,7 @@ import path from "node:path";
 import {fileURLToPath} from "node:url";
 import {findChrome} from "../src/chrome.mjs";
 import {loadConfig, normalizeConfig} from "../src/scenario.mjs";
-import {runSet} from "../src/runner.mjs";
+import {runSet, runSingle} from "../src/runner.mjs";
 import {startDemoServer} from "../demo/server.mjs";
 import {HAVE_FFMPEG, tmpDir} from "./helpers.mjs";
 
@@ -29,10 +29,17 @@ test("demo end to end: headless Chrome, both start actions, OOPIF marks, variant
         }
         const tl = JSON.parse(fs.readFileSync(path.join(root, "a", "cold", "landing", "run-1.timeline.json"), "utf8"));
         assert.ok(tl.marks.some(m => m.mark === "frameReady" && m.frame === "iframe" && m.variant === "baseline"), "marks from the cross-site iframe are collected");
-        const s = JSON.parse(fs.readFileSync(path.join(root, "b", "cold", "panel", "run-1.summary.json"), "utf8"));
-        assert.match(s.t0Source, /click/);
-        assert.ok(s.clearing.before.every(c => c.ok), "cold clearing steps all succeeded");
-        assert.ok(res.sync && res.sync.n >= 4, "sync flash measured");
+        const click = JSON.parse(fs.readFileSync(path.join(root, "b", "cold", "panel", "run-1.summary.json"), "utf8"));
+        assert.match(click.t0Source, /press listener/, "the click scenario syncs on the recorder's listener");
+        assert.ok(click.clearing.before.every(c => c.ok), "cold clearing steps all succeeded");
+        const nav = JSON.parse(fs.readFileSync(path.join(root, "a", "hot", "landing", "run-1.summary.json"), "utf8"));
+        assert.match(nav.t0Source, /ABMark.sync/, "the navigation scenario syncs on the page's ABMark.sync()");
+        for (const x of [click, nav]) {
+            assert.equal(x.sync.ok, true);
+            assert.equal(x.sync.method, "marker");
+            assert.ok(x.sync.lagMs >= 0 && x.sync.lagMs < 100, `plausible lag ${x.sync.lagMs}`);
+        }
+        assert.ok(res.sync && res.sync.n >= 8 && res.sync.failed === 0, "every run's marker found");
         assert.equal(res.videos.length, 4);
         for (const v of res.videos) assert.ok(fs.statSync(v.file).size > 10000);
     } finally {
@@ -64,6 +71,26 @@ test("every variant strategy reaches the page and passes the variant check", {sk
             assert.equal(s.ab.variantOk, true, `${name}/${v}`);
             assert.ok(s.variantReport.globals.includes(values[v]), `${name}/${v} reported ${s.variantReport.globals}`);
         }
+    } finally {
+        await server.close();
+        fs.rmSync(root, {recursive: true, force: true});
+    }
+});
+
+test("single run against the demo: one run, printed timeline, full-size video", {skip, timeout: 300000}, async () => {
+    const server = await startDemoServer({port: 0});
+    process.env.AB_DEMO_BASE_URL = server.baseUrl;
+    const root = tmpDir("demo-single");
+    try {
+        const config = await loadConfig(path.join(HERE, "..", "demo", "scenarios.mjs"));
+        const res = await runSingle({config, scenario: "panel", variant: "a", phase: "cold", root, allowBattery: true, quiet: true});
+        assert.equal(res.summary.ab.valid, true);
+        assert.equal(res.summary.sync.method, "marker");
+        const text = res.lines.join("\n");
+        assert.match(text, /variant: expected baseline, page reported baseline -> ok/);
+        assert.match(text, /dataReceived/);
+        assert.equal(res.video.tile, "900x640");
+        assert.ok(fs.existsSync(path.join(root, "a", "cold", "panel", "run-1.console.json")));
     } finally {
         await server.close();
         fs.rmSync(root, {recursive: true, force: true});

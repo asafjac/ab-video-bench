@@ -2,17 +2,19 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {buildRunTimeline} from "../src/timeline.mjs";
 
-test("buildRunTimeline puts every mark relative to t0, in order, with first occurrences", () => {
+test("buildRunTimeline puts every mark relative to t0 (the sync line), in order, with first occurrences", () => {
     const t0 = 1_000_000;
-    const tl = buildRunTimeline({summary: {t0Epoch: t0, t0Source: "click", visibleMs: 900, scenario: "list", label: "run-1", variant: "b", phase: "cold"},
+    const tl = buildRunTimeline({summary: {t0Epoch: t0, t0Source: "sync line", visibleMs: 900, scenario: "list", label: "run-1", variant: "b", phase: "cold"},
         marks: [{mark: "dataReceived", frame: "top", epochMs: t0 + 500, variant: "candidate", consoleTs: 1},
+            {mark: "sync", frame: "top", source: "recorder", epochMs: t0, variant: "candidate"},
             {mark: "dataRequested", frame: "iframe", epochMs: t0 + 200.26, variant: "candidate"},
             {mark: "dataRequested", frame: "top", epochMs: t0 + 700, variant: "candidate"},
-            {mark: "syncFlashOn", frame: "top", source: "recorder", epochMs: t0 - 1000, variant: null}]});
-    assert.deepEqual(tl.marks.map(m => m.mark), ["syncFlashOn", "start", "dataRequested", "dataReceived", "dataRequested"]);
-    assert.deepEqual(tl.first, {syncFlashOn: -1000, start: 0, dataRequested: 200.3, dataReceived: 500, visible: 900});
+            {mark: "navigationStart", frame: "top", source: "recorder", epochMs: t0 - 40, variant: null}]});
+    assert.deepEqual(tl.marks.map(m => m.mark), ["navigationStart", "sync", "dataRequested", "dataReceived", "dataRequested"]);
+    assert.deepEqual(tl.first, {navigationStart: -40, sync: 0, dataRequested: 200.3, dataReceived: 500, visible: 900});
     assert.equal(tl.reportedVariant, "candidate");
     assert.equal(tl.marks[2].frame, "iframe");
+    assert.match(tl.unit, /sync line/);
     assert.ok(tl.marks.every(m => m.consoleTs === undefined));
 });
 

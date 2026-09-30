@@ -24,7 +24,7 @@ try {
         mock: args.has("mock"), allowBattery: true, chrome: {executable: args.get("chrome"), headless: !args.has("headed")}});
     console.log(`\nreport: ${res.reportFile}`);
     for (const v of res.videos) console.log(`video:  ${v.file}`);
-    if (res.sync && res.sync.n) console.log(`sync lag (frame minus mark): on median ${res.sync.onMedian} ms [${res.sync.onMin}–${res.sync.onMax}], off median ${res.sync.offMedian} ms, n=${res.sync.n}`);
+    if (res.sync && res.sync.n) console.log(`sync lag (first marker frame minus its drawing frame): median ${res.sync.lag.median} ms [${res.sync.lag.min}–${res.sync.lag.max}], removal median ${res.sync.offLag ? res.sync.offLag.median : "—"} ms, n=${res.sync.n}`);
     process.exitCode = res.state === "done" && !res.rejected.length && !res.failed.length ? 0 : 2;
 } catch (e) {
     fail(`ab-demo: ${e.message}`);

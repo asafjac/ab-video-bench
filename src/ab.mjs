@@ -4,7 +4,7 @@ import {median, stats, r1} from "./stats.mjs";
 
 export const VARIANTS = ["a", "b"];
 export const PHASES = ["cold", "hot"];
-export const INTERNAL_MARKS = new Set(["start", "startAction", "navigationStart", "syncFlashOn", "syncFlashOff", "variantSet", "hidden", "visible"]);
+export const INTERNAL_MARKS = new Set(["sync", "syncFrame", "syncEnd", "startAction", "navigationStart", "syncFlashOn", "syncFlashOff", "variantSet", "hidden", "visible"]);
 
 /** Per scenario: cold warm-up pairs, cold pairs, hot priming pairs, hot pairs; every pair is A then B so drift hits both. */
 export function abSchedule({scenarios, cold, hot, coldWarmup = 1, hotPrime = 1}) {
@@ -30,7 +30,21 @@ export function checkVariant(summary, expected) {
     return {ok: true};
 }
 
-export const isValid = (r) => !r.ab || r.ab.variantOk;
+/** {ok, reason?}: the run has a sync line and its marker (or the optional flash) was found in the frames. */
+export function checkSync(summary) {
+    const s = summary.sync;
+    if (!s) return {ok: false, reason: "no sync measurement in the summary"};
+    return s.ok ? {ok: true} : {ok: false, reason: s.reason};
+}
+
+/** The `ab` block the runner stores on every summary: validity is the variant check and the sync check together. */
+export function abVerdict(summary, item, expected) {
+    const v = checkVariant(summary, expected), s = checkSync(summary);
+    return {v, ab: {variant: item.variant, phase: item.phase, measured: item.measured, variantOk: v.ok, variantReason: v.reason || null,
+        syncOk: s.ok, syncReason: s.reason || null, valid: v.ok && s.ok, reason: [v.reason, s.reason].filter(Boolean).join("; ") || null}};
+}
+
+export const isValid = (r) => !r.ab || (r.ab.valid ?? r.ab.variantOk);
 
 export function readRuns(root, variant, phase, scenario) {
     const dir = path.join(root, variant, phase, scenario);
@@ -72,13 +86,17 @@ export function markMedians(root, phase, scenario, markNames = discoverMarks(roo
     }).filter(Boolean);
 }
 
+const range = (xs) => (xs.length ? {median: r1(median(xs)), min: Math.min(...xs), max: Math.max(...xs)} : null);
+
+/** Per-run frame-vs-log lag over every measured run of the given scenarios (summary.sync). */
 export function syncSummary(root, scenarios) {
     const syncs = [];
     for (const v of VARIANTS) for (const p of PHASES) for (const s of scenarios) for (const r of readRuns(root, v, p, s)) if (r.sync) syncs.push(r.sync);
     if (!syncs.length) return null;
-    const ok = syncs.filter(x => x.ok), on = ok.map(x => x.onErrorMs), off = ok.map(x => x.offErrorMs);
-    return ok.length ? {n: ok.length, failed: syncs.length - ok.length, onMedian: r1(median(on)), onMin: Math.min(...on), onMax: Math.max(...on),
-        offMedian: r1(median(off)), offMin: Math.min(...off), offMax: Math.max(...off)} : {n: 0, failed: syncs.length};
+    const ok = syncs.filter(x => x.ok);
+    const nums = (k) => ok.map(x => x[k]).filter(x => typeof x === "number");
+    return {n: ok.length, failed: syncs.length - ok.length, byFlash: ok.filter(x => x.method === "flash").length,
+        lag: range(nums("lagMs")), offLag: range(nums("offLagMs")), pressToFrame: range(nums("pressToFrameMs"))};
 }
 
 export function compareScenario(root, phase, scenario, markNames) {
@@ -89,7 +107,7 @@ export function compareScenario(root, phase, scenario, markNames) {
     const delta = vis.a && vis.b ? vis.b.median - vis.a.median : null;
     const counts = Object.fromEntries(VARIANTS.map(v => [v, {runs: all[v].length, valid: valid[v].length, rejected: all[v].length - valid[v].length,
         notVisible: valid[v].filter(r => r.visibleMs == null).length}]));
-    const rejected = VARIANTS.flatMap(v => all[v].filter(r => !isValid(r)).map(r => ({variant: v, run: r._run, reason: r.ab.variantReason})));
+    const rejected = VARIANTS.flatMap(v => all[v].filter(r => !isValid(r)).map(r => ({variant: v, run: r._run, reason: r.ab.reason || r.ab.variantReason})));
     return {phase, scenario, visible: {a: vis.a, b: vis.b, delta, deltaPct: delta != null && vis.a.median ? delta / vis.a.median * 100 : null},
         counts, rejected, marks: markMedians(root, phase, scenario, markNames)};
 }
@@ -98,8 +116,9 @@ const f0 = (x) => (x == null ? "—" : String(Math.round(x)));
 const sgn = (x) => (x == null ? "—" : `${x > 0 ? "+" : ""}${Math.round(x)}`);
 const pct = (x) => (x == null ? "—" : `${x > 0 ? "+" : ""}${x.toFixed(1)}%`);
 const q = (s) => (s ? `${f0(s.median)} [${f0(s.p25)}–${f0(s.p75)}]` : "—");
+const rng = (x) => (x ? `median ${x.median} ms [${x.min}–${x.max}]` : "—");
 
-/** {rows, md, sync}: A vs B per phase and scenario, ms after the start action; scenarios: [{name, label?, labels?, marks?}]. */
+/** {rows, md, sync}: A vs B per phase and scenario, ms after the sync line; scenarios: [{name, label?, labels?, marks?}]. */
 export function buildReport(root, scenarios, meta = {}) {
     const rows = [];
     for (const phase of PHASES) for (const s of scenarios) {
@@ -108,8 +127,8 @@ export function buildReport(root, scenarios, meta = {}) {
         if (r) rows.push({...r, label: s.label || s.name, labels: s.labels || {a: "A", b: "B"}});
     }
     let md = `# A/B page-load report\n\n${meta.title || path.basename(root)}\n\n` +
-        "All times are ms after t0 (the start action), median [p25–p75] over measured runs. Warm-up and priming runs are discarded; " +
-        "runs whose page reported the wrong variant are excluded (rejected). Δ = B − A, negative = B faster.\n";
+        "All times are ms after t0 (the run's `sync` line, logged at the start action), median [p25–p75] over measured runs. Warm-up and priming runs " +
+        "are discarded; runs whose page reported the wrong variant, or that have no usable sync, are excluded (rejected). Δ = B − A, negative = B faster.\n";
     if (meta.definitions) md += `\n${meta.definitions}\n`;
     md += "\n## Headline: visible\n\n| phase | scenario | n A/B | A | IQR A | B | IQR B | Δ median | Δ % | not visible A/B | rejected |\n" +
         "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|\n";
@@ -134,11 +153,11 @@ export function buildReport(root, scenarios, meta = {}) {
     }
     const sync = syncSummary(root, scenarios.map(s => s.name));
     if (sync) {
-        md += `\n## Frame / mark alignment (sync flash)\n\n`;
-        md += sync.n ? `Screencast frame time minus the page's own mark, over ${sync.n} runs: flash on median ${sync.onMedian} ms [${sync.onMin}–${sync.onMax}], ` +
-            `flash off median ${sync.offMedian} ms [${sync.offMin}–${sync.offMax}]${sync.failed ? `; ${sync.failed} run(s) without a usable flash` : ""}. ` +
-            "Positive = the frame showing a change arrives after the page marked it (rAF, paint, compositor). Videos shift frames by the minimum.\n"
-            : `No usable flash in ${sync.failed} run(s).\n`;
+        md += "\n## Frame / log alignment (sync marker)\n\n";
+        md += sync.n ? `Each run's frames are shifted by that run's own measured lag. Over ${sync.n} runs: lag (first frame showing the marker minus ` +
+            `the animation frame that drew it) ${rng(sync.lag)}; marker removal ${rng(sync.offLag)}; sync line to its drawing frame ${rng(sync.pressToFrame)}` +
+            `${sync.byFlash ? `; ${sync.byFlash} run(s) aligned by the fallback flash` : ""}${sync.failed ? `; ${sync.failed} run(s) without a usable sync (rejected)` : ""}.\n`
+            : `No usable sync in ${sync.failed} run(s).\n`;
     }
     if (meta.videos && meta.videos.length) {
         md += `\n## Videos\n\n`;

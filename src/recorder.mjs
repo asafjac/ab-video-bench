@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import {Cdp} from "./cdp.mjs";
-import {syncFlashJs, measureSync} from "./sync.mjs";
+import {syncFlashJs, resolveSync, DEFAULT_MARKER} from "./sync.mjs";
 import {buildRunTimeline} from "./timeline.mjs";
 
 export const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -37,6 +37,27 @@ function pageAgent(CFG, visible) {
             if (CFG.start === "navigate") emit("navigationStart", performance.timeOrigin, {url: location.href});
             document.addEventListener("visibilitychange", () => { if (document.visibilityState !== "visible") emit("hidden", now()); });
         }
+        // Recorder-side sync: the press on the start selector logs `sync` at the event's timestamp and draws the corner marker.
+        if (isTop && web && CFG.start === "click" && CFG.sync === "recorder") {
+            document.addEventListener("pointerdown", (ev) => {
+                const t = ev.target;
+                if (agent.synced || !t || !t.closest || !t.closest(CFG.selector)) return;
+                agent.synced = true;
+                const mk = CFG.marker, vw = innerWidth, vh = innerHeight;
+                const x = /right/.test(mk.corner) ? vw - mk.size : 0, y = /bottom/.test(mk.corner) ? vh - mk.size : 0;
+                emit("sync", performance.timeOrigin + ev.timeStamp, {syncTop: true, selector: CFG.selector, marker: {x, y, size: mk.size, color: mk.color, ms: mk.ms, vw, vh}});
+                const el = document.createElement("div");
+                el.setAttribute("data-ab-sync-marker", "");
+                el.setAttribute("aria-hidden", "true");
+                el.style.cssText = `position:fixed;left:${x}px;top:${y}px;width:${mk.size}px;height:${mk.size}px;background:${mk.color};z-index:2147483647;pointer-events:none;margin:0;padding:0;border:0`;
+                document.documentElement.appendChild(el);
+                requestAnimationFrame(() => {
+                    emit("syncFrame", now());
+                    setTimeout(() => requestAnimationFrame(() => { el.remove(); emit("syncEnd", now()); }), mk.ms);
+                });
+                if (watchHere) arm();
+            }, true);
+        }
         if (isTop && CFG.start === "click") {
             document.addEventListener("click", (ev) => {
                 const t = ev.target;
@@ -49,8 +70,9 @@ function pageAgent(CFG, visible) {
     } catch (e) { /* never break the page */ }
 }
 
-const agentScript = (scenario, prefix) => `(${pageAgent.toString()})(${JSON.stringify({prefix, start: scenario.start.type, selector: scenario.start.selector || null,
-    visibleFrame: scenario.visibleFrame})}, ${scenario.visibleSource});`;
+const agentScript = (scenario, prefix, marker) => `window.__abSyncMarker = ${JSON.stringify(marker)};
+(${pageAgent.toString()})(${JSON.stringify({prefix, start: scenario.start.type, selector: scenario.start.selector || null,
+    visibleFrame: scenario.visibleFrame, sync: scenario.sync, marker})}, ${scenario.visibleSource});`;
 
 const cropJs = (sel) => `(() => { const el = document.querySelector(${JSON.stringify(sel)}); if (!el) return null; const r = el.getBoundingClientRect();
     return {x: r.x, y: r.y, w: r.width, h: r.height, vw: innerWidth, vh: innerHeight, dpr: devicePixelRatio}; })()`;
@@ -58,7 +80,7 @@ const cropJs = (sel) => `(() => { const el = document.querySelector(${JSON.strin
 /** CDP recorder: a fresh tab per run, OOPIFs auto-attached, mark lines from every frame, timestamped screencast frames. */
 export class Recorder {
     constructor(opts = {}) {
-        Object.assign(this, {prefix: "[ABMARK]", ffmpeg: "ffmpeg", settleMs: 1000, timeoutMs: 30000, preRollMs: 800, syncFlash: true,
+        Object.assign(this, {prefix: "[ABMARK]", ffmpeg: "ffmpeg", settleMs: 1000, timeoutMs: 30000, preRollMs: 800, syncFlash: false, syncMarker: DEFAULT_MARKER,
             viewport: {width: 1280, height: 800}, log: console.log}, opts);
         this.sessions = new Map();
         this.run = null;
@@ -255,7 +277,7 @@ export class Recorder {
         const prefix = path.join(outDir, label), framesDir = `${prefix}.frames`;
         const strategy = scenario.strategy;
         const tab = await this.openTab();
-        const initScript = [strategy.initScript(variant), agentScript(scenario, this.prefix)].filter(Boolean).join("\n");
+        const initScript = [strategy.initScript(variant), agentScript(scenario, this.prefix, {...DEFAULT_MARKER, ...this.syncMarker})].filter(Boolean).join("\n");
         const run = this.run = {P: tab.P, initScript, linePrefix: `${this.prefix} `, cacheDisabled: phase === "cold", header: strategy.header(variant),
             contexts: new Map(), marks: [], console: [], recording: false, screencast: null};
         const clearing = {before: [], preT0: [], after: []};
@@ -324,19 +346,21 @@ export class Recorder {
         }
         if (failure) { fs.rmSync(framesDir, {recursive: true, force: true}); throw failure; }
 
+        const sync = resolveSync({marks: run.marks, frames, flash: this.syncFlash ? flash : null, ffmpeg: this.ffmpeg});
         const t0m = findT0(run.marks, scenario);
-        const t0Epoch = t0m ? t0m.epochMs : startedWall;
-        const t0Source = t0m ? (t0m.mark === "startAction" ? "capture-phase click listener on the start selector" : "performance.timeOrigin of the navigated document")
-            : "recorder wall clock before the start action (no start mark seen)";
+        const t0Epoch = sync.epochMs ?? (t0m ? t0m.epochMs : startedWall);
+        const t0Source = sync.epochMs != null ? (scenario.sync === "recorder" ? "sync line from the recorder's press listener on the start selector" : "sync line logged by the page (ABMark.sync)")
+            : t0m ? `no sync line; ${t0m.mark} used for reference only` : "no sync line; recorder wall clock used for reference only";
         const vis = run.marks.find(m => m.mark === "visible" && m.source === "recorder" && m.epochMs >= t0Epoch);
         const visibleMs = vis ? Math.round((vis.epochMs - t0Epoch) * 10) / 10 : null;
         const pageVariants = run.marks.filter(m => m.source !== "recorder" && m.variant != null).map(m => String(m.variant));
         const summary = {scenario: scenario.name, label, variant, phase, url, startAction: scenario.start.type === "click" ? {click: scenario.start.selector, target: clicked} : {navigate: url},
-            state: visibleMs == null ? "timeout" : "visible", visibleMs, t0Epoch, t0Source, variantReport: {expected: strategy.expected(variant), globals, marks: [...new Set(pageVariants)]},
+            state: visibleMs == null ? "timeout" : "visible", visibleMs, t0Epoch, t0Source, sync,
+            variantReport: {expected: strategy.expected(variant), globals, marks: [...new Set(pageVariants)]},
             cropRect, browser: this.browserVersion, clearing, frames: frames.length};
-        if (visibleMs == null) summary.consoleTail = run.console.slice(-30);
-        if (this.syncFlash) summary.sync = measureSync(frames, flash, this.ffmpeg);
+        if (visibleMs == null || !sync.ok) summary.consoleTail = run.console.slice(-30);
         fs.writeFileSync(`${prefix}.timeline.json`, JSON.stringify(buildRunTimeline({summary, marks: run.marks}), null, 1));
+        fs.writeFileSync(`${prefix}.console.json`, JSON.stringify(run.console, null, 1));
         if (keepFrames) fs.writeFileSync(path.join(framesDir, "index.json"), JSON.stringify(frames.map(f => ({ts: f.ts, file: path.basename(f.file)}))));
         else fs.rmSync(framesDir, {recursive: true, force: true});
         fs.writeFileSync(`${prefix}.summary.json`, JSON.stringify(summary, null, 2));

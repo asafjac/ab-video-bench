@@ -14,7 +14,7 @@ const PADDING = `\n/*${"0123456789abcdef".repeat(12800)}*/\n`;
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 // The variant arrives as a request header, a ?variant= parameter or the ab_variant cookie (resolved here), or in localStorage (resolved in the page).
-const page = ({title, body, frameSrc, variant}) => `<!doctype html>
+const page = ({title, body, frameSrc, variant, syncOnLoad}) => `<!doctype html>
 <html lang="en" data-variant="${variant || ""}"><head><meta charset="utf-8"><title>${title}</title>
 <link rel="stylesheet" href="/style.css">
 <script src="/abmark.js"></script>
@@ -23,7 +23,8 @@ const page = ({title, body, frameSrc, variant}) => `<!doctype html>
     var v = document.documentElement.getAttribute("data-variant");
     if (!v) { try { v = localStorage.getItem("ab_variant"); } catch (e) { v = null; } }
     if (v) ABMark.setVariant(v);
-  })();
+  })();${syncOnLoad ? `
+  ABMark.sync();` : ""}
 </script>
 </head><body>
 <header><h1>${title}</h1><span id="variant"></span></header>
@@ -50,7 +51,7 @@ export async function startDemoServer({port = 0, apiDelayMs = 350, bundleDelayMs
         const frameSrc = `http://${otherHost}/frame${variant ? `?variant=${variant}` : ""}`;
         switch (url.pathname) {
             case "/":
-                return send(200, "text/html; charset=utf-8", page({title: "Demo dashboard", frameSrc, variant,
+                return send(200, "text/html; charset=utf-8", page({title: "Demo dashboard", frameSrc, variant, syncOnLoad: true,
                     body: `<main id="grid" class="grid" data-autoload="1"></main>`}));
             case "/panel":
                 return send(200, "text/html; charset=utf-8", page({title: "Demo reports", variant,
