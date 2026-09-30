@@ -58,6 +58,14 @@ export async function startDemoServer({port = 0, apiDelayMs = 350, bundleDelayMs
                     body: `<button id="open" type="button">Open report</button><main id="panel" class="grid"></main>`}));
             case "/frame":
                 return send(200, "text/html; charset=utf-8", FRAME_PAGE);
+            // A page whose cross-site iframe sits behind HTTP Basic auth, like a protected staging site the browser
+            // profile has not signed in to: for the --auth-challenges tests.
+            case "/guarded":
+                return send(200, "text/html; charset=utf-8", page({title: "Demo guarded", variant, syncOnLoad: true, frameSrc: `http://${otherHost}/private`,
+                    body: `<main id="grid" class="grid"></main>`}));
+            case "/private":
+                res.writeHead(401, {"WWW-Authenticate": "Basic realm=\"demo staging\"", "Content-Type": "text/plain", "Cache-Control": "no-store"});
+                return res.end("sign in required");
             case "/abmark.js":
                 return send(200, "text/javascript", SNIPPET, "max-age=600");
             case "/style.css":

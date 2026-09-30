@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import {median, stats, r1} from "./stats.mjs";
+import {authReason} from "./auth.mjs";
 
 export const VARIANTS = ["a", "b"];
 export const PHASES = ["cold", "hot"];
@@ -37,11 +38,20 @@ export function checkSync(summary) {
     return s.ok ? {ok: true} : {ok: false, reason: s.reason};
 }
 
-/** The `ab` block the runner stores on every summary: validity is the variant check and the sync check together. */
+/** {ok, reason?}: the run met no HTTP auth challenge (see auth.mjs). */
+export function checkAuth(summary) {
+    const c = summary.authChallenges || [];
+    return c.length ? {ok: false, reason: authReason(c)} : {ok: true};
+}
+
+/** The `ab` block the runner stores on every summary: validity is the variant, sync and auth checks together. */
 export function abVerdict(summary, item, expected) {
-    const v = checkVariant(summary, expected), s = checkSync(summary);
+    const a = checkAuth(summary), s = checkSync(summary);
+    // A challenged page usually never loads, so it reports no variant: that is the challenge, not a missing snippet.
+    const v0 = checkVariant(summary, expected), v = !a.ok && v0.missing ? {ok: false, reason: null} : v0;
     return {v, ab: {variant: item.variant, phase: item.phase, measured: item.measured, variantOk: v.ok, variantReason: v.reason || null,
-        syncOk: s.ok, syncReason: s.reason || null, valid: v.ok && s.ok, reason: [v.reason, s.reason].filter(Boolean).join("; ") || null}};
+        syncOk: s.ok, syncReason: s.reason || null, authOk: a.ok, authReason: a.reason || null, valid: v.ok && s.ok && a.ok,
+        reason: [a.reason, v.reason, s.reason].filter(Boolean).join("; ") || null}};
 }
 
 export const isValid = (r) => !r.ab || (r.ab.valid ?? r.ab.variantOk);

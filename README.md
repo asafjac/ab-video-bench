@@ -27,6 +27,7 @@ No runtime dependencies: Node's standard library, a Chrome/Chromium, and ffmpeg.
 - [Write a scenario config](#write-a-scenario-config)
 - [Variant strategies](#variant-strategies)
 - [Run an A/B set](#run-an-ab-set)
+- [HTTP auth challenges](#http-auth-challenges)
 - [Diagnostics: single run](#diagnostics-single-run)
 - [Render videos](#render-videos)
 - [Output layout](#output-layout)
@@ -230,6 +231,7 @@ ab-bench --config bench/scenarios.mjs --cold 5 --hot 5
 | `--sync-flash` | off | also show the old pre-run flash; used only when a run's marker is not found |
 | `--max-width`, `--max-height` | 1920, 1080 | output video cap |
 | `--allow-battery` | | do not wait for AC power |
+| `--auth-challenges cancel\|ignore` | cancel | what to do with an HTTP auth challenge (401 / 407 sign-in); see [HTTP auth challenges](#http-auth-challenges) |
 | `--mock` | | no browser, see [Mock mode](#mock-mode) |
 
 Per scenario the order is: cold warm-ups, cold pairs, hot priming, hot pairs, each pair A then B. Every run gets a fresh tab,
@@ -243,6 +245,25 @@ report and videos for what it has. Exit code 0 means every run finished and pass
 When you attach with `--port`, the recorder opens and closes its own tabs, and it uses `chrome://net-internals` in a
 background tab to flush DNS and sockets for cold runs. It clears the whole browser's HTTP cache for cold runs, so prefer a
 dedicated profile.
+
+## HTTP auth challenges
+
+A page behind HTTP authentication (say, a Basic-auth protected staging site at `https://staging.example.test`) answers a
+browser that has not signed in with `401` and a `WWW-Authenticate` header. Left alone, Chrome opens its sign-in dialog over
+the tab: the run waits for visible until its timeout, and a cold run's HTTP cache clear and socket flush would close a dialog
+someone is typing into. The same goes for a cross-site iframe on the page, and for a proxy asking with `407`.
+
+| Mode | What happens |
+|---|---|
+| `--auth-challenges cancel` (default) | Every document request of the run's tab and its iframe targets is paused through the Fetch domain with `handleAuthRequests`. A challenge is answered with `CancelAuth`, so no dialog opens and the run stops waiting at once. The run is rejected: `REJECTED (HTTP auth challenge from https://staging.example.test (basic): sign in to the browser profile first)`. |
+| `--auth-challenges ignore` | The browser handles challenges as it would without this option (a dialog may open). Challenges seen in responses are still recorded. After such a run the set stops before the next cold run instead of clearing the cache and flushing sockets under an open dialog: `ABORTED: ... not run: an HTTP auth dialog may be open ...`. |
+
+- Every summary has `authChallenges: [{origin, scheme, realm, url, frame, handled}]` (`handled`: `cancelled` or `none`), and a
+  challenged run's `ab.authOk` is false with the reason in `ab.reason`. A challenged page usually reports no variant; that is
+  reported as the challenge and does not abort the set.
+- Only documents are paused for this, so subresource requests are not slowed. It composes with the `header` variant strategy:
+  one `Fetch.enable` carries both patterns, and only requests matching the strategy's `urlPattern` get the header.
+- Sign the browser profile in first (attach with `--port` to a Chrome that already has the credentials), then run.
 
 ## Diagnostics: single run
 
@@ -420,7 +441,8 @@ npm test                 # node --test
 ```
 
 Alternation order, stats, the variant check (a mismatch excludes the run, a missing report aborts the set), the sync check
-(a missing sync line rejects the run), the STOP file, timeline building, sync-lag recovery through the marker with injected
+(a missing sync line rejects the run), HTTP auth challenges (a cancelled one rejects the run, one left to the browser stops
+the set before the next cold run, and a real cross-site iframe behind Basic auth in headless Chrome), the STOP file, timeline building, sync-lag recovery through the marker with injected
 lags and through the fallback flash, the snippet's line format and its `sync()` / `syncOnPress()`, golden frame plans for the
 all-runs, median and single-run videos (`tests/golden/mock-render.json`), render-twice-same-md5 for the all-runs video, the
 layout cap, argument validation, the single-run mode, and the demo end to end in headless Chrome: both start actions, every
@@ -437,6 +459,7 @@ After an intentional renderer change, refresh the golden file with `AB_UPDATE_GO
 | Runs `REJECTED (the sync marker is in none of the ... frames)` | Something covers the marker's corner (move it with `syncMarker.corner`), its color matches the page there (change `syncMarker.color`), or the tab did not paint. `--sync-flash` adds a fallback measurement. |
 | Every run is `timeout` | The `visible` predicate never became true, or it references a variable from the config file. The summary's `consoleTail` and `run-N.console.json` show the page's console. |
 | `chrome://net-internals controls missing` in `clearing` | A Chrome build without those buttons. Cold runs still clear and disable the HTTP cache; DNS and sockets are not flushed. |
+| Runs `REJECTED (HTTP auth challenge from ...)` | The browser profile is not signed in to that origin, or lost its credentials. Sign it in by hand, then rerun; see [HTTP auth challenges](#http-auth-challenges). |
 | `no Chrome/Chromium found` | Pass `--chrome <path>` or set `CHROME_PATH`. |
 | `no TrueType font found` | Pass `--font file.ttf` (and `--font-bold`), or set `AB_FONT`. |
 | `tiles do not fit` | Too many runs for the output cap: raise `--max-width` / `--max-height`, or render `--median`. |

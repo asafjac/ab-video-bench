@@ -11,6 +11,7 @@ import {resolveSync} from "./sync.mjs";
 import {buildRunTimeline} from "./timeline.mjs";
 import {renderAbVideo} from "./render.mjs";
 import {findFonts} from "./media.mjs";
+import {authMode, authReason} from "./auth.mjs";
 
 const J = (x) => JSON.stringify(x, null, 2);
 
@@ -20,11 +21,11 @@ export function defaultRoot(base = "ab-results", suffix = "") {
     for (let i = 1; ; i++) { const p = i === 1 ? stem : `${stem}-${i}`; if (!fs.existsSync(p)) return p; }
 }
 
-async function openRecorder({config, chrome, ffmpeg, log, settleMs, timeoutMs, syncFlash}) {
+async function openRecorder({config, chrome, ffmpeg, log, settleMs, timeoutMs, syncFlash, authChallenges}) {
     let browser = null;
     const wsUrl = chrome.port ? (await browserWsUrl(chrome.port)).wsUrl : (browser = await launchChrome({executable: chrome.executable, headless: chrome.headless !== false,
         width: config.viewport.width, height: config.viewport.height + 100})).wsUrl;
-    const rec = new Recorder({prefix: config.prefix, viewport: config.viewport, ffmpeg, log, syncFlash: !!syncFlash, ...(config.syncMarker ? {syncMarker: config.syncMarker} : {}),
+    const rec = new Recorder({prefix: config.prefix, viewport: config.viewport, ffmpeg, log, syncFlash: !!syncFlash, authChallenges, ...(config.syncMarker ? {syncMarker: config.syncMarker} : {}),
         ...(settleMs != null ? {settleMs} : {}), ...(timeoutMs != null ? {timeoutMs} : {})});
     await rec.connect(wsUrl);
     log(`browser: ${rec.browserVersion}${browser ? ` (launched ${chrome.headless === false ? "headed" : "headless"}, port ${browser.port})` : ` (attached, port ${chrome.port})`}`);
@@ -38,6 +39,7 @@ export async function runSet(opts) {
     const {config, cold = 5, hot = 5, coldWarmup = 1, hotPrime = 1, only = null, mock = false, videos = true, videoMedian = false,
         speed = 0.5, fps = 30, chrome = {}, allowBattery = false, settleMs, timeoutMs, syncFlash = false, maxWidth, maxHeight,
         ffmpeg = "ffmpeg", ffprobe = "ffprobe", mockOptions = {}, quiet = false} = opts;
+    const authChallenges = authMode(opts.authChallenges);
     for (const [n, v] of Object.entries({cold, hot, coldWarmup, hotPrime})) if (!Number.isInteger(v) || v < 0) throw new Error(`${n} must be an integer >= 0`);
     if (cold + hot < 1) throw new Error("nothing to run: cold and hot are both 0");
     const scenarios = only ? config.scenarios.filter(s => only.includes(s.name)) : config.scenarios;
@@ -52,7 +54,7 @@ export async function runSet(opts) {
     const definitions = `cold = HTTP cache disabled and cleared, DNS host cache + socket pools flushed right before the start action (after ${coldWarmup} discarded A+B warm-up pair(s)). ` +
         `hot = same browser profile, HTTP cache, DNS and connections kept, after ${hotPrime} discarded A+B priming pair(s). ` +
         "Both: fresh tab per run, target-origin storage cleared before and after every run.";
-    fs.writeFileSync(path.join(root, "plan.json"), J({mode: "ab", mock, cold, hot, coldWarmup, hotPrime, prefix: config.prefix, viewport: config.viewport, syncFlash, definitions,
+    fs.writeFileSync(path.join(root, "plan.json"), J({mode: "ab", mock, cold, hot, coldWarmup, hotPrime, prefix: config.prefix, viewport: config.viewport, syncFlash, authChallenges, definitions,
         scenarios: scenarios.map(scenarioPlan), schedule}));
     const progressFile = path.join(root, "progress.json");
     const progress = {root, mock, startedAt: new Date().toISOString(), total: schedule.length, done: 0, current: null, elapsedMs: 0, etaMs: null,
@@ -60,12 +62,17 @@ export async function runSet(opts) {
     const saveProgress = () => { fs.writeFileSync(progressFile + ".tmp", J(progress)); fs.renameSync(progressFile + ".tmp", progressFile); };
 
     log(`# ab-bench ${progress.startedAt} ${mock ? "MOCK " : ""}scenarios=${scenarios.map(s => s.name).join(",")} cold=${cold} (+${coldWarmup} warm-up pairs) hot=${hot} (+${hotPrime} priming pairs) root=${root}`);
-    const session = mock ? null : await openRecorder({config, chrome, ffmpeg, log, settleMs, timeoutMs, syncFlash});
+    const session = mock ? null : await openRecorder({config, chrome, ffmpeg, log, settleMs, timeoutMs, syncFlash, authChallenges});
     log(definitions);
+    log(`HTTP auth challenges: ${authChallenges === "cancel" ? "cancelled (the run is rejected, no browser dialog)" : "left to the browser (--auth-challenges ignore)"}`);
     for (const s of scenarios) log(`scenario ${s.name}: ${s.start.type} ${s.start.type === "click" ? s.start.selector : s.url}; variant via ${s.strategy.describe}; sync by the ${s.sync}`);
 
     const t0 = Date.now();
     let abortReason = null;
+    // An HTTP auth challenge left to the browser (--auth-challenges ignore) may leave its sign-in dialog open; a cold run's
+    // cache clear and socket flush would close it under whoever is answering it, so the set stops before the next cold run.
+    let authPending = null;
+    const noteAuth = (challenges) => { const open = (challenges || []).filter(c => c.handled === "none"); if (open.length) authPending = authReason(open); };
     saveProgress();
     try {
         for (const item of schedule) {
@@ -75,6 +82,11 @@ export async function runSet(opts) {
             fs.mkdirSync(outDir, {recursive: true});
             progress.current = item; saveProgress();
             const tag = `${item.scenario} ${item.phase} ${item.variant.toUpperCase()} ${item.label}`;
+            if (item.phase === "cold" && authPending) {
+                abortReason = `${tag} not run: an HTTP auth dialog may be open (${authPending}). A cold run clears the HTTP cache and flushes sockets, which would close it: ` +
+                    "answer or close the dialog, then rerun";
+                break;
+            }
             try {
                 let s;
                 if (mock) s = mockOne({scenario, item, outDir, frames: videos, keepFrames: videos && item.measured, ordinal: progress.done, mockOptions, ffmpeg, fonts, syncFlash});
@@ -84,12 +96,14 @@ export async function runSet(opts) {
                 }
                 const {v, ab} = abVerdict(s, item, scenario.strategy.expected(item.variant));
                 s.ab = ab;
+                noteAuth(s.authChallenges);
                 fs.writeFileSync(path.join(outDir, `${item.label}.summary.json`), J(s));
                 log(`  ${tag}: visible=${s.visibleMs ?? "—"} (${s.state})${syncText(s.sync)} ${ab.valid ? "ok" : `REJECTED (${ab.reason})`}`);
                 if (!ab.valid) progress.rejected.push({...item, reason: ab.reason});
                 if (v.missing) { abortReason = `${tag}: ${v.reason}`; break; }
             } catch (e) {
                 log(`  ${tag} FAILED: ${e.message}`);
+                noteAuth(e.authChallenges);
                 progress.failed.push({...item, error: e.message});
                 if (session && session.rec.cdp.closed) { abortReason = "the browser connection closed"; break; }
                 if (!(e instanceof FatalRunError)) await sleep(500);
@@ -133,6 +147,7 @@ export async function runSet(opts) {
 export async function runSingle(opts) {
     const {config, scenario: name, variant = "b", phase = "cold", prime = false, mock = false, videos = true, speed = 0.5, fps = 30, chrome = {},
         allowBattery = false, settleMs, timeoutMs, syncFlash = false, maxWidth, maxHeight, ffmpeg = "ffmpeg", ffprobe = "ffprobe", mockOptions = {}, quiet = false} = opts;
+    const authChallenges = authMode(opts.authChallenges);
     if (!VARIANTS.includes(variant)) throw new Error(`--variant must be a or b, got "${variant}"`);
     if (!PHASES.includes(phase)) throw new Error(`phase must be cold or hot, got "${phase}"`);
     if (prime && phase !== "hot") throw new Error("--prime only applies to a hot single run (--hot)");
@@ -147,7 +162,7 @@ export async function runSingle(opts) {
     const fonts = videos ? findFonts(opts.fonts || {}) : null;
     fs.writeFileSync(path.join(root, "plan.json"), J({mode: "single", mock, variant, phase, prime, prefix: config.prefix, viewport: config.viewport, syncFlash, scenarios: [scenarioPlan(scenario)]}));
     log(`# ab-bench single run ${new Date().toISOString()} ${mock ? "MOCK " : ""}${name} ${phase} ${variant.toUpperCase()} = ${scenario.labels[variant]}${prime ? " after 1 priming run" : ""} root=${root}`);
-    const session = mock ? null : await openRecorder({config, chrome, ffmpeg, log, settleMs, timeoutMs, syncFlash});
+    const session = mock ? null : await openRecorder({config, chrome, ffmpeg, log, settleMs, timeoutMs, syncFlash, authChallenges});
     const items = [...(prime ? [{scenario: name, phase, variant, measured: false, label: "warmup-1"}] : []), {scenario: name, phase, variant, measured: true, label: "run-1"}];
     let summary = null;
     try {
@@ -205,6 +220,9 @@ function mockOne({scenario, item, outDir, frames, keepFrames, ordinal, mockOptio
     const run = mockRun({scenario, variant: item.variant, phase: item.phase, label: item.label, runOrdinal: ordinal, reported, lagMs: mockOptions.lagMs ?? 12,
         sync: mockOptions.noSync !== key, flash: syncFlash});
     run.summary.variantReport.expected = expected;
+    // mockOptions.authChallenge = {key, handled: "cancelled" | "none"}: that run met an HTTP auth challenge.
+    const ac = mockOptions.authChallenge;
+    run.summary.authChallenges = ac && ac.key === key ? [{origin: new URL(scenario.url).origin, scheme: "basic", realm: "mock", url: scenario.url, frame: "top", handled: ac.handled || "cancelled"}] : [];
     const prefix = path.join(outDir, item.label);
     if (frames) {
         const written = writeMockFrames({dir: `${prefix}.frames`, run, ffmpeg, fonts});

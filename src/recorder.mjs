@@ -3,6 +3,7 @@ import path from "node:path";
 import {Cdp} from "./cdp.mjs";
 import {syncFlashJs, resolveSync, DEFAULT_MARKER} from "./sync.mjs";
 import {buildRunTimeline} from "./timeline.mjs";
+import {fetchEnableParams, urlPatternMatches, challengeFromFetch, challengeFromResponse, authReason} from "./auth.mjs";
 
 export const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 export class FatalRunError extends Error {}
@@ -81,7 +82,7 @@ const cropJs = (sel) => `(() => { const el = document.querySelector(${JSON.strin
 export class Recorder {
     constructor(opts = {}) {
         Object.assign(this, {prefix: "[ABMARK]", ffmpeg: "ffmpeg", settleMs: 1000, timeoutMs: 30000, preRollMs: 800, syncFlash: false, syncMarker: DEFAULT_MARKER,
-            viewport: {width: 1280, height: 800}, log: console.log}, opts);
+            viewport: {width: 1280, height: 800}, log: console.log, authChallenges: "cancel"}, opts);
         this.sessions = new Map();
         this.run = null;
         this.netInternals = null;
@@ -118,9 +119,21 @@ export class Recorder {
         if (!run || !m.sessionId || this.rootOf(m.sessionId) !== run.P) return;
         const p = m.params || {};
         if (m.method === "Fetch.requestPaused") {
+            if (!run.header || !urlPatternMatches(run.header.urlPattern, p.request.url)) { this.send("Fetch.continueRequest", {requestId: p.requestId}, m.sessionId).catch(() => {}); return; }
             const headers = Object.entries(p.request.headers || {}).filter(([k]) => k.toLowerCase() !== run.header.name.toLowerCase()).map(([name, value]) => ({name, value}));
             headers.push({name: run.header.name, value: run.header.value});
             this.send("Fetch.continueRequest", {requestId: p.requestId, headers}, m.sessionId).catch(() => {});
+            return;
+        }
+        if (m.method === "Fetch.authRequired") {
+            // A cross-site iframe's own document is requested (and paused) in its parent's session, so the frame id tells.
+            run.authChallenges.push(challengeFromFetch(p, p.frameId && run.targetId && p.frameId !== run.targetId ? "iframe" : "top"));
+            this.send("Fetch.continueWithAuth", {requestId: p.requestId, authChallengeResponse: {response: "CancelAuth"}}, m.sessionId).catch(() => {});
+            return;
+        }
+        if (m.method === "Network.responseReceived" && run.authMode === "ignore") {
+            const c = challengeFromResponse(p, m.sessionId === run.P ? "top" : "iframe");
+            if (c) run.authChallenges.push(c);
             return;
         }
         if (m.method === "Runtime.consoleAPICalled" && run.recording) {
@@ -153,7 +166,7 @@ export class Recorder {
         const run = this.run;
         await this.send("Network.enable", {}, sid).catch(() => {});
         await this.send("Network.setCacheDisabled", {cacheDisabled: run.cacheDisabled}, sid).catch(() => {});
-        if (run.header) await this.send("Fetch.enable", {patterns: [{urlPattern: run.header.urlPattern, requestStage: "Request"}]}, sid).catch(() => {});
+        if (run.fetch) await this.send("Fetch.enable", run.fetch, sid).catch(() => {});
         if (info.type === "iframe") {
             await this.send("Page.enable", {}, sid).catch(() => {});
             await this.send("Runtime.enable", {}, sid).catch(() => {});
@@ -191,6 +204,7 @@ export class Recorder {
         const until = Date.now() + timeoutMs;
         while (Date.now() < until) {
             if (await this.evalTop(P, `!!document.querySelector(${JSON.stringify(readySelector)})`).catch(() => false)) return;
+            if (this.run && this.run.P === P && this.run.authChallenges.length) throw new FatalRunError(authReason(this.run.authChallenges));
             await sleep(100);
         }
         throw new FatalRunError(`${readySelector} did not appear on ${url} within ${timeoutMs / 1000} s`);
@@ -278,7 +292,9 @@ export class Recorder {
         const strategy = scenario.strategy;
         const tab = await this.openTab();
         const initScript = [strategy.initScript(variant), agentScript(scenario, this.prefix, {...DEFAULT_MARKER, ...this.syncMarker})].filter(Boolean).join("\n");
-        const run = this.run = {P: tab.P, initScript, linePrefix: `${this.prefix} `, cacheDisabled: phase === "cold", header: strategy.header(variant),
+        const header = strategy.header(variant);
+        const run = this.run = {P: tab.P, targetId: tab.targetId, initScript, linePrefix: `${this.prefix} `, cacheDisabled: phase === "cold", header,
+            authMode: this.authChallenges, fetch: fetchEnableParams({header, mode: this.authChallenges}), authChallenges: [],
             contexts: new Map(), marks: [], console: [], recording: false, screencast: null};
         const clearing = {before: [], preT0: [], after: []};
         const timeoutMs = scenario.timeoutMs || this.timeoutMs;
@@ -289,7 +305,7 @@ export class Recorder {
             await this.send("Emulation.setDeviceMetricsOverride", {width, height, deviceScaleFactor: 1, mobile: false}, run.P);
             await this.send("Network.enable", {}, run.P);
             await this.send("Network.setCacheDisabled", {cacheDisabled: run.cacheDisabled}, run.P);
-            if (run.header) await this.send("Fetch.enable", {patterns: [{urlPattern: run.header.urlPattern, requestStage: "Request"}]}, run.P);
+            if (run.fetch) await this.send("Fetch.enable", run.fetch, run.P);
             await this.send("Page.enable", {}, run.P);
             await this.send("Runtime.enable", {}, run.P);
             await this.send("Page.addScriptToEvaluateOnNewDocument", {source: initScript}, run.P);
@@ -322,6 +338,7 @@ export class Recorder {
             while (Date.now() < deadline) {
                 const t0 = findT0(run.marks, scenario);
                 if (t0 && run.marks.some(m => m.mark === "visible" && m.source === "recorder" && m.epochMs >= t0.epochMs)) break;
+                if (run.authChallenges.length) break;
                 await sleep(50);
             }
             await sleep(scenario.settleMs ?? this.settleMs);
@@ -344,7 +361,11 @@ export class Recorder {
             await this.send("Target.closeTarget", {targetId: tab.targetId}, undefined, 10000).catch(() => {});
             this.run = null;
         }
-        if (failure) { fs.rmSync(framesDir, {recursive: true, force: true}); throw failure; }
+        if (failure) {
+            fs.rmSync(framesDir, {recursive: true, force: true});
+            if (run.authChallenges.length) failure.authChallenges = run.authChallenges;
+            throw failure;
+        }
 
         const sync = resolveSync({marks: run.marks, frames, flash: this.syncFlash ? flash : null, ffmpeg: this.ffmpeg});
         const t0m = findT0(run.marks, scenario);
@@ -357,7 +378,8 @@ export class Recorder {
         const summary = {scenario: scenario.name, label, variant, phase, url, startAction: scenario.start.type === "click" ? {click: scenario.start.selector, target: clicked} : {navigate: url},
             state: visibleMs == null ? "timeout" : "visible", visibleMs, t0Epoch, t0Source, sync,
             variantReport: {expected: strategy.expected(variant), globals, marks: [...new Set(pageVariants)]},
-            cropRect, browser: this.browserVersion, clearing, frames: frames.length};
+            cropRect, browser: this.browserVersion, clearing, frames: frames.length,
+            authChallenges: run.authChallenges, ...(run.authChallenges.length ? {authReason: authReason(run.authChallenges)} : {})};
         if (visibleMs == null || !sync.ok) summary.consoleTail = run.console.slice(-30);
         fs.writeFileSync(`${prefix}.timeline.json`, JSON.stringify(buildRunTimeline({summary, marks: run.marks}), null, 1));
         fs.writeFileSync(`${prefix}.console.json`, JSON.stringify(run.console, null, 1));

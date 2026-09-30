@@ -96,3 +96,23 @@ test("single run against the demo: one run, printed timeline, full-size video", 
         fs.rmSync(root, {recursive: true, force: true});
     }
 });
+
+test("an HTTP auth challenge in a cross-site iframe is cancelled, recorded and rejects the run quickly", {skip, timeout: 300000}, async () => {
+    const server = await startDemoServer({port: 0});
+    const root = tmpDir("demo-auth");
+    try {
+        const config = normalizeConfig({viewport: {width: 900, height: 640}, scenarios: [{name: "guarded", url: `${server.baseUrl}/guarded`,
+            variant: {type: "query", param: "variant", values: {a: "baseline", b: "candidate"}}, visible: "false", timeoutMs: 20000}]});
+        const t0 = Date.now();
+        const res = await runSingle({config, scenario: "guarded", variant: "a", phase: "cold", root, allowBattery: true, quiet: true, videos: false});
+        assert.ok(Date.now() - t0 < 15000, "the run stopped at the challenge instead of waiting for its timeout");
+        assert.equal(res.summary.ab.valid, false);
+        assert.equal(res.summary.ab.authOk, false);
+        assert.ok(res.summary.ab.reason.startsWith(`HTTP auth challenge from ${server.frameBaseUrl} (basic)`), res.summary.ab.reason);
+        assert.equal(res.summary.authChallenges[0].frame, "iframe");
+        assert.equal(res.summary.authChallenges[0].handled, "cancelled");
+    } finally {
+        await server.close();
+        fs.rmSync(root, {recursive: true, force: true});
+    }
+});
