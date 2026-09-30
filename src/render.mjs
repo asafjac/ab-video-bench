@@ -33,7 +33,7 @@ function loadTile(root, variant, phase, scenario, run, median) {
     const t0 = run.t0Epoch, shiftMs = run.sync && run.sync.ok ? run.sync.lagMs : 0;
     const frames = JSON.parse(fs.readFileSync(index, "utf8")).map(f => ({rel: f.ts - t0 - shiftMs, file: path.join(`${base}.frames`, f.file)})).sort((a, b) => a.rel - b.rel);
     const timeline = fs.existsSync(`${base}.timeline.json`) ? JSON.parse(fs.readFileSync(`${base}.timeline.json`, "utf8")) : {first: {}};
-    return {variant, run: run._run, visible: run.visibleMs ?? null, rect: run.cropRect || null, marker: run.sync && run.sync.marker, shiftMs, median,
+    return {variant, run: run._run, t0Epoch: t0 ?? null, visible: run.visibleMs ?? null, rect: run.cropRect || null, marker: run.sync && run.sync.marker, shiftMs, median,
         valid: isValid(run), frames, first: {...timeline.first, visible: run.visibleMs ?? undefined}};
 }
 
@@ -135,12 +135,17 @@ export function renderAbVideo({root, phase, scenario, mode = "all", single = nul
             t.dir = path.join(tmp, `t${k}`); fs.mkdirSync(t.dir);
             t.freeze = t.visible == null ? null : (t.frames.find(f => f.rel >= t.visible && f.rel <= t.visible + FREEZE_LAG_MS) || [...t.frames].reverse().find(f => f.rel <= t.visible + FREEZE_LAG_MS) || null);
             let j = -1;
+            // Run-length encoded for the sidecar: [first output frame, last output frame, source frame or null, source ms].
+            t.selection = [];
             for (let n = 0; n < FRAMES; n++) {
                 const at = msAt(n);
                 let src;
                 if (t.freeze && at >= t.visible) src = t.freeze.file;
                 else { while (j + 1 < t.frames.length && t.frames[j + 1].rel <= at + 1e-9) j++; src = j >= 0 ? t.frames[j].file : placeholder; }
                 planHash.update(`${k}:${n}:${src === placeholder ? "-" : `${t.variant}/${t.run}/${path.basename(src)}`}\n`);
+                const srcName = src === placeholder ? null : path.basename(src), last = t.selection[t.selection.length - 1];
+                if (last && last[2] === srcName) last[1] = n;
+                else t.selection.push([n, n, srcName, srcName ? Math.round((t.freeze && at >= t.visible ? t.freeze.rel : t.frames[j].rel) * 10) / 10 : null]);
                 const dst = path.join(t.dir, `s${String(n).padStart(5, "0")}.jpg`);
                 try { fs.linkSync(src, dst); } catch { fs.copyFileSync(src, dst); }
             }
@@ -166,6 +171,7 @@ export function renderAbVideo({root, phase, scenario, mode = "all", single = nul
             const barY = TH + Math.round(12 * o.s);
             g += `,drawbox=x=${MX}:y=${barY}:w=${BAR_W}:h=${Math.max(2, Math.round(4 * o.s))}:color=0x5a5f6e:t=fill`;
             const ticks = tickDefs.map(d => ({...d, t: t.first[d.k]})).filter(d => typeof d.t === "number" && d.t >= 0).sort((a, b) => a.t - b.t);
+            t.ticks = ticks.map(d => ({name: d.k, label: d.label, ms: Math.round(d.t * 10) / 10}));
             // Labels go in the first of LABEL_ROWS rows where they do not overlap the previous label (estimated width).
             const rowEnd = new Array(LABEL_ROWS).fill(-Infinity);
             ticks.forEach((d) => {
@@ -181,6 +187,7 @@ export function renderAbVideo({root, phase, scenario, mode = "all", single = nul
             if (t.median && mode === "all") g += `,drawbox=x=0:y=0:w=${cellW}:h=${cellH}:color=${MEDIAN_COLOR}:t=${o.margin}`;
             return g + `[t${k}]`;
         });
+        columns.forEach((col, c) => col.forEach((t, i) => { t.cell = {side: c, index: i, col: i % L.cols, row: Math.floor(i / L.cols)}; }));
         const layout = columns.flatMap((col, c) => col.map((_, i) =>
             `${GAP + c * (blockW + SIDE_GAP) + (i % L.cols) * (cellW + GAP)}_${Math.floor(i / L.cols) * (cellH + GAP)}`)).join("|");
         let g = all.length > 1
@@ -220,8 +227,20 @@ export function renderAbVideo({root, phase, scenario, mode = "all", single = nul
         const poster = out.replace(/\.mp4$/, ".jpg");
         execFileSync(ffmpeg, ["-y", "-v", "error", "-i", out, "-vf", `select=eq(n\\,${Math.min(FRAMES - 1, Math.ceil(posterAt / speed / 1000 * fps))})`, "-frames:v", "1", "-q:v", "3",
             "-fflags", "+bitexact", "-flags:v", "+bitexact", poster]);
-        return {out, poster, mode, size: `${W}x${H}`, tile: `${TW}x${TH}`, grid: `${L.cols}x${L.rows}`, fps, speed, realMs: END_MS, frames: FRAMES, crf, phase, scenario,
-            planSha256: planHash.digest("hex"), tiles: all.map(t => ({variant: t.variant, run: t.run, visible: t.visible, shiftMs: t.shiftMs, median: t.median,
+        const planSha256 = planHash.digest("hex");
+        // The sidecar describes what the video shows, from the same inputs. It holds no absolute paths and no clock readings,
+        // so re-rendering the same set writes the same bytes.
+        const sidecar = {scenario, phase, mode, speed, fps, size: `${W}x${H}`, tile: `${TW}x${TH}`, grid: `${L.cols}x${L.rows}`, frames: FRAMES, realMs: END_MS, crf, planSha256,
+            header: {headline, second: second || "", info, medians: {a: vis.a ? vis.a.median : null, b: vis.b ? vis.b.median : null}, deltaMs: d,
+                deltaPct: d != null && vis.a ? Math.round(d / vis.a.median * 1000) / 10 : null},
+            selectionFormat: "per tile: [first output frame, last output frame, source frame in <variant>/<phase>/<scenario>/<run>.frames/ (null = placeholder), source ms on the run's aligned clock]",
+            tiles: all.map(t => ({variant: t.variant, run: t.run, cell: t.cell || {side: 0, index: 0, col: 0, row: 0}, t0Epoch: t.t0Epoch, syncLagMs: t.shiftMs,
+                visibleMs: t.visible, median: !!t.median, valid: t.valid, freezeFrameRelMs: t.freeze ? Math.round(t.freeze.rel * 10) / 10 : null,
+                freezeFrame: t.freeze ? path.basename(t.freeze.file) : null, ticks: t.ticks || [], selection: t.selection}))};
+        const sidecarFile = out.replace(/\.mp4$/, ".json");
+        fs.writeFileSync(sidecarFile, JSON.stringify(sidecar, null, 1) + "\n");
+        return {out, poster, sidecar: sidecarFile, mode, size: `${W}x${H}`, tile: `${TW}x${TH}`, grid: `${L.cols}x${L.rows}`, fps, speed, realMs: END_MS, frames: FRAMES, crf, phase, scenario,
+            planSha256, tiles: all.map(t => ({variant: t.variant, run: t.run, visible: t.visible, shiftMs: t.shiftMs, median: t.median,
                 freezeFrameRelMs: t.freeze ? Math.round(t.freeze.rel) : null}))};
     } finally { fs.rmSync(tmp, {recursive: true, force: true}); }
 }

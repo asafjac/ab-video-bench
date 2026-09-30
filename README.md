@@ -335,7 +335,7 @@ each tile ends up tiny and far from the header. Two side-by-side grids keep all 
   progress.json                 live state: done, current, ETA, rejected, failed
   run.log                       one line per run
   report.md, report.json
-  videos/<phase>-<scenario>[-median].{mp4,jpg}
+  videos/<phase>-<scenario>[-median].{mp4,jpg,json}   video, poster, and a JSON sidecar describing the video
   {a,b}/{cold,hot}/<scenario>/
     run-N.summary.json          visibleMs, t0, sync (lag, method, marker), variant report, checks, clearing steps
     run-N.timeline.json         every mark, ms relative to the sync line, plus first occurrences
@@ -343,6 +343,12 @@ each tile ends up tiny and far from the header. Two side-by-side grids keep all 
     run-N.frames/               screencast JPEGs + index.json [{ts, file}]
     warmup-N.summary.json       warm-up and priming runs (no frames)
 ```
+
+Every rendered video (all runs, `--median`, single run) has a `.json` sidecar with the same name: scenario, phase, mode,
+speed, output size, `planSha256`, the header text and medians / Δ, and per tile its variant, run, grid cell, t0 (sync epoch),
+sync lag, visible ms, median flag, freeze frame, the ticks drawn (name, label, ms), and the frame selection as runs of
+`[first output frame, last output frame, source frame, source ms]`. Like the video, it is byte-identical across re-renders of
+the same set.
 
 `report.md` lists, per phase and scenario: n, median, p25–p75, IQR for A and B, Δ median and Δ % (B − A, negative = B faster),
 runs that never became visible, and rejected runs. Then per-mark medians for A and B with their Δ, rejected runs with reasons,
